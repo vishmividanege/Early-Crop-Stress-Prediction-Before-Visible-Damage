@@ -3,3 +3,7 @@ uvicorn
 earthengine-api
 python-multipart
 requests
+numpy
+torch
+torchvision
+Pillow
