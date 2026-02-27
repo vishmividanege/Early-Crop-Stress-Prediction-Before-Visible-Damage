@@ -79,7 +79,7 @@ def fetch_features(boundary_geojson: dict, days: int = 30) -> dict:
         "days": days
     }
 
-def fetch_patch_as_array(boundary_geojson: dict, size: int = 224) -> dict:
+def fetch_patch_as_array(boundary_geojson: dict, size: int = 224, end_date: str = None) -> dict:
     """
     Fetches a 6-channel image patch (R, G, B, NDVI, VV, VH) centered on the polygon.
     Returns a numpy-ready array (or URL to download it).
@@ -87,7 +87,11 @@ def fetch_patch_as_array(boundary_geojson: dict, size: int = 224) -> dict:
     poly = _geojson_to_polygon(boundary_geojson)
     center = poly.centroid(10)
     
-    end = datetime.date.today()
+    if end_date:
+        end = datetime.datetime.strptime(end_date, "%Y-%m-%d").date()
+    else:
+        end = datetime.date.today()
+        
     start = end - datetime.timedelta(days=180) # Much larger window for tropical cloud-free imagery
 
     # S2 RGB + NDVI
@@ -142,5 +146,58 @@ def fetch_patch_as_array(boundary_geojson: dict, size: int = 224) -> dict:
             "channels": ["R", "G", "B", "NDVI", "VV", "VH"],
             "status": "success"
         }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+def fetch_daily_timeseries(boundary_geojson: dict, days: int = 7) -> dict:
+    """
+    Fetches image patches for multiple days in a single Earth Engine request.
+    This avoids sequential getInfo() calls which cause timeouts.
+    """
+    poly = _geojson_to_polygon(boundary_geojson)
+    center = poly.centroid(10)
+    
+    # 1. Create a collection of daily medians for the last 'days' days
+    today = datetime.date.today()
+    images = []
+    
+    # We fetch 8 days (0 to 7)
+    for i in range(days + 1):
+        target_date = today - datetime.timedelta(days=i)
+        start = target_date - datetime.timedelta(days=90) # wide window for cloud fallback
+        end = target_date + datetime.timedelta(days=1)
+        
+        # S2
+        s2 = (ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+              .filterBounds(center)
+              .filterDate(str(start), str(end))
+              .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 50))
+              .median())
+        
+        rgb = s2.select(["B4", "B3", "B2"])
+        ndvi = s2.normalizedDifference(["B8", "B4"]).rename("NDVI")
+        
+        # S1
+        s1 = (ee.ImageCollection("COPERNICUS/S1_GRD")
+              .filterBounds(center)
+              .filterDate(str(start), str(end))
+              .filter(ee.Filter.eq("instrumentMode", "IW"))
+              .median().select(["VV", "VH"]))
+        
+        combined = ee.Image.cat([rgb, ndvi, s1])
+        # Rename bands to include day offset so we can separate them after getInfo
+        # Mapping: 0=Today, 1=Yesterday...
+        combined = combined.rename([f"d{i}_R", f"d{i}_G", f"d{i}_B", f"d{i}_NDVI", f"d{i}_VV", f"d{i}_VH"])
+        images.append(combined)
+
+    # 2. Stack all images into one mega-image
+    mega_image = ee.Image.cat(images)
+    
+    # 3. Sample as a single patch
+    patch = mega_image.neighborhoodToArray(ee.Kernel.square(radius=112, units='pixels'))
+    
+    try:
+        data = patch.sample(center, 10).first().toDictionary().getInfo()
+        return {"status": "success", "data": data}
     except Exception as e:
         return {"status": "error", "message": str(e)}
